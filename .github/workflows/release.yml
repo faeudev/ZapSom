@@ -1,0 +1,205 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: false
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+env:
+  PORTABLE_NODE_VERSION: "22.18.0"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install, test, and build
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+          npm prune --omit=dev
+      - name: Package portable Windows x64 bundle
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag.StartsWith("v")) { $tag = "${{ github.event.inputs.tag }}" }
+          $ver = $tag.TrimStart("v")
+
+          $stageRoot = "stage/ZapSom"
+          New-Item -ItemType Directory -Force -Path "$stageRoot/runtime" | Out-Null
+          New-Item -ItemType Directory -Force -Path "release-assets" | Out-Null
+
+          $nodeZip = "node-win.zip"
+          Invoke-WebRequest -Uri "https://nodejs.org/dist/v${env:PORTABLE_NODE_VERSION}/node-v${env:PORTABLE_NODE_VERSION}-win-x64.zip" -OutFile $nodeZip
+          Expand-Archive -Path $nodeZip -DestinationPath "node-extract" -Force
+          Copy-Item "node-extract/node-v${env:PORTABLE_NODE_VERSION}-win-x64/node.exe" "$stageRoot/runtime/node.exe"
+
+          Copy-Item "package.json", "LICENSE", "README.md" $stageRoot
+          Copy-Item "dist" "$stageRoot/dist" -Recurse
+          Copy-Item "dist-server" "$stageRoot/dist-server" -Recurse
+          Copy-Item "node_modules" "$stageRoot/node_modules" -Recurse
+
+          @'
+          @echo off
+          setlocal
+          cd /d "%~dp0"
+          echo Iniciando ZapSom em http://127.0.0.1:3847 ...
+          start "" cmd /c "timeout /t 2 /nobreak >nul && start http://127.0.0.1:3847"
+          "%~dp0runtime\node.exe" "%~dp0dist-server\index.js"
+          if errorlevel 1 pause
+          '@ | Set-Content -Path "$stageRoot/ZapSom.bat" -Encoding ASCII
+
+          Compress-Archive -Path $stageRoot -DestinationPath "release-assets/ZapSom-${ver}-windows-x64.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-assets
+          path: release-assets/*
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install and build
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+          npm prune --omit=dev
+      - name: Package portable macOS arm64 bundle
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" != v* ]]; then TAG="${{ github.event.inputs.tag }}"; fi
+          VERSION="${TAG#v}"
+
+          STAGE="stage/ZapSom"
+          mkdir -p "$STAGE/runtime" release-assets
+
+          curl -fsSL "https://nodejs.org/dist/v${PORTABLE_NODE_VERSION}/node-v${PORTABLE_NODE_VERSION}-darwin-arm64.tar.gz" -o node-mac.tar.gz
+          tar -xzf node-mac.tar.gz
+          cp "node-v${PORTABLE_NODE_VERSION}-darwin-arm64/bin/node" "$STAGE/runtime/node"
+          chmod +x "$STAGE/runtime/node"
+
+          cp package.json LICENSE README.md "$STAGE/"
+          cp -R dist dist-server node_modules "$STAGE/"
+
+          cat > "$STAGE/ZapSom.command" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$(dirname "$0")"
+          echo "Iniciando ZapSom em http://127.0.0.1:3847 ..."
+          (sleep 2 && open "http://127.0.0.1:3847") &
+          exec "./runtime/node" "./dist-server/index.js"
+          EOF
+          chmod +x "$STAGE/ZapSom.command"
+
+          (cd stage && zip -rq "../release-assets/ZapSom-${VERSION}-macos-arm64.zip" ZapSom)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-assets
+          path: release-assets/*
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install, test, and build
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+          npm prune --omit=dev
+      - name: Package portable Linux x64 bundle
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" != v* ]]; then TAG="${{ github.event.inputs.tag }}"; fi
+          VERSION="${TAG#v}"
+
+          STAGE="stage/ZapSom"
+          mkdir -p "$STAGE/runtime" release-assets
+
+          curl -fsSL "https://nodejs.org/dist/v${PORTABLE_NODE_VERSION}/node-v${PORTABLE_NODE_VERSION}-linux-x64.tar.xz" -o node-linux.tar.xz
+          tar -xJf node-linux.tar.xz
+          cp "node-v${PORTABLE_NODE_VERSION}-linux-x64/bin/node" "$STAGE/runtime/node"
+          chmod +x "$STAGE/runtime/node"
+
+          cp package.json LICENSE README.md "$STAGE/"
+          cp -r dist dist-server node_modules "$STAGE/"
+
+          cat > "$STAGE/zapsom.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$(dirname "$0")"
+          echo "Iniciando ZapSom em http://127.0.0.1:3847 ..."
+          (sleep 2 && (xdg-open "http://127.0.0.1:3847" >/dev/null 2>&1 || true)) &
+          exec "./runtime/node" "./dist-server/index.js"
+          EOF
+          chmod +x "$STAGE/zapsom.sh"
+
+          tar -czf "release-assets/ZapSom-${VERSION}-linux-x64.tar.gz" -C stage ZapSom
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-assets
+          path: release-assets/*
+
+  publish-release:
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          ls -lh
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref_name, 'v') && github.ref_name || github.event.inputs.tag }}
+          name: ZapSom ${{ startsWith(github.ref_name, 'v') && github.ref_name || github.event.inputs.tag }} — Windows, macOS & Linux
+          generate_release_notes: true
+          body: |
+            ## Pacotes prontos para uso (sem precisar instalar Node.js nem FFmpeg)
+
+            | Plataforma | Arquivo | Como abrir |
+            | --- | --- | --- |
+            | **Windows (64-bit)** | `ZapSom-*-windows-x64.zip` | Extraia o ZIP e dê duplo clique em **`ZapSom.bat`** |
+            | **macOS (Apple Silicon)** | `ZapSom-*-macos-arm64.zip` | Extraia o ZIP e execute **`ZapSom.command`** *(clique direito → Abrir na primeira vez)* |
+            | **Linux (64-bit)** | `ZapSom-*-linux-x64.tar.gz` | Extraia o arquivo e execute **`./zapsom.sh`** |
+
+            ### O que está incluído
+            - Envio direto de **figurinhas nativas com som (🔊)** para o WhatsApp via QR Code.
+            - Editor completo da linha do tempo do áudio com minimapa e zoom (suporta áudios longos de vários minutos, recorte de `0.2s` a `10.0s`).
+            - Suporte a `PNG` transparente, `JPG`, `WebP`, `GIF` animado, vídeos curtos e links do **MyInstants**.
+            - Identidade visual no tema escuro do WhatsApp Web + pacote EXIF `ZapSom - Faeudev`.
+            - Baseado no projeto original [SilverFeit/StikSound](https://github.com/SilverFeit/StikSound?tab=readme-ov-file).
+          files: artifacts/*
